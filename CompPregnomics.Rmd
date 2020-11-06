@@ -1,0 +1,645 @@
+---
+title: Analysis work-flow for the article _Targeted expression profiling by RNA-Seq
+  improves detection of cellular dynamics during pregnancy and identifies a role for
+  T cells in term parturition_
+author: "Adi L Tarca and Vincent J. Carey"
+date: "November 29, 2018"
+output:
+  html_document: default
+bibliography: pregnomics.bib
+---
+
+
+
+## Introduction
+This document illustrates the analysis workflow included in the manuscript **Targeted expression profiling by RNA-Seq improves detection of cellular dynamics during pregnancy and identifies a role for T cells in term parturition** [@Tarca2018scirep]. 
+The goal of the analysis is to compare three omics platforms (Affymetrix HTA 2.0 microarrays, Illumina RNA-Seq, and targeted profiling by DriverMap) to detect changes with gestational age and with labor at term in whole blood samples collected from pregnant women.
+
+
+## Loading required packages
+To access the data needed for analysis, we install and load the _pregnomics_ package that includes all expression data sets and relevant metadata. You may also need to install the _devtools_ package:
+
+```{r include=TRUE, message=FALSE, warning=FALSE}
+library(devtools)
+if(!require(pregnomics)){
+install_github("atarca/pregnomics")
+}else{library(pregnomics)}
+```
+Additional packages, including several from Bioconductor [@pmid15461798], needed for analysis, are also loaded. Note the version of annotation packages needed to reproduce the results described in [@Tarca2018scirep].
+
+```{r include=TRUE, message=FALSE, warning=FALSE}
+library(hta20sttranscriptcluster.db) #hta20sttranscriptcluster.db_8.3.1
+library(org.Hs.eg.db)  #org.Hs.eg.db_3.2.3
+library(EnsDb.Hsapiens.v75) # EnsDb.Hsapiens.v75_2.99.0
+library(annotate)   #annotate_1.48.0
+library(limma)
+library(DESeq2)
+library(UpSetR)
+library(epiR)
+library(pROC)
+library(ROCR)
+library(gplots)
+library(Heatplus)
+library(marray)
+library(lme4)
+library(splines)
+```
+
+
+## Study Design
+The characteristics of the 32 blood samples are provided in the _ano32_ table which corresponds to Table S1 in [@Tarca2018scirep]. 
+```{r include=TRUE}
+data(ano32)
+ano32$T=factor(ifelse(ano32$GA<37,"Preterm","Term")) #define gestational age interval
+anoALL<-ano32
+head(anoALL,n=3)
+```
+The analysis studying the effect of gestational age (GA) (term vs preterm gestation) is based on data from both women that had a spontaneous labor at term (TIL) and those that delivered by cesarean section (TNL) and had 3 longitudinal samples collected during gestation:
+
+
+
+
+```{r echo=TRUE}
+anoGA=anoALL[anoALL$GAAnalysis==1,]
+plot(as.numeric(as.factor(IndividualID))~GA,data=anoGA,col=ifelse(anoGA$Group=="TIL","red","black"),pch=19,xlab="GA",ylab="Patient")
+legend("topleft",legend=c("TIL","TNL"),pch=c(19,19),col=c("red","black"))
+abline(v=37,lty=2,col="grey")
+```
+
+The analysis studying the effect of labor at term (TIL vs TNL) is based on all samples collected at delivery:
+
+```{r echo=TRUE}
+anoLabor=anoALL[anoALL$LaborAnalysis==1,]
+plot(as.numeric(as.factor(IndividualID))~GA,data=anoLabor,col=ifelse(anoLabor$Group=="TIL","red","black"),pch=19,xlab="GA",ylab="Patient",xlim=range(ano32$GA))
+legend("topleft",legend=c("TIL","TNL"),pch=c(19,19),col=c("red","black"))
+```
+
+
+## Gene expression data
+
+Gene expression data for HTA microarrays, RNA-Seq, DriverMap and qRT-PCR are availble loading the respective matrices: 
+```{r echo=TRUE}
+data(package="pregnomics",list=c("esetHTA","Rcount","Ccount","esetPCR"))
+```
+Of note _esetHTA_ and _esetPCR_ data is on a log2 scale and can be reasonably assumed to be normally distributed. Therefore the _limma_ package [@pmid25605792]  will be leveraged to create functions that return the differential expression results for these datasets.
+In turn, _Rcount_ and _Ccount_ data obtained via sequencing are count data and hence will be analyzed using negative binomial models using the _DESeq2_ package[@pmid25516281].
+
+## Differential expression analysis for normally distributed data (microarray and qRT-PCR)
+We define below a function that fits log2 gene expression data as a function of the gestational age interval (term vs preterm gestation, variable _T_) and uses a fixed effect for each woman (_IndividualID_) so that we obtain estimates of within subject changes with gestation:
+
+```{r echo=TRUE}
+analyzeGA_limma=function(ano,eset){
+  ano$ID=factor(ano$IndividualID)
+  design <- model.matrix(~0+T+IndividualID,ano)
+  eset=eset[,rownames(ano)]
+  colnames(design)<-substr(colnames(design),2,100)
+  fit <- lmFit(eset, design)
+  cont.matrix <- makeContrasts( contrasts="Term-Preterm",levels=design)
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  aT1<-topTable(fit2,coef=1, number=1000000, adjust="fdr")
+  aT1$FC=2^abs(aT1$logFC)*sign(aT1$logFC) #signed linear fold change
+  aT1$ID=rownames(aT1)
+  aT1
+}
+
+```
+
+Similarly, we define a function that perfroms the unpaired analysis between TIL and TNL groups, where _Group_ is the variable defining the TIL vs TNL status:  
+
+```{r echo=TRUE}
+analyzeLabor_limma=function(ano,eset){
+design <- model.matrix(~0+Group,ano) 
+colnames(design)<-gsub("Group","",colnames(design))
+fit <- lmFit(eset, design)
+cont.matrix <- makeContrasts( contrasts="TIL-TNL",levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+aT1<-topTable(fit2,coef=1, number=1000000, adjust="fdr")
+aT1$FC=2^abs(aT1$logFC)*sign(aT1$logFC) #signed linear fold change
+aT1$ID=rownames(aT1)
+aT1
+}
+```
+### Differential expression with HTA microarray data 
+
+We define here the annotation package that will be used to map Affymetrix transcript cluster IDs to gene symbols, and initialize a list to sore _limma_ top tables for HTA data: 
+```{r echo=TRUE}
+anpack="hta20sttranscriptcluster"
+HTA=list() #will store DE results with GA and Labor
+```
+
+We call the _analyzeGA_limma_ function created above passing the sample annotation data frame for this analysis _ano_ and the HTA expression data for the corresponding samples _eset_:  
+
+```{r echo=TRUE}
+#GA effect
+aT1=analyzeGA_limma(anoGA,esetHTA[,rownames(anoGA)])
+head(aT1,n=3)
+```
+Next we add gene annotation and remove transcript clusters without a valid _ENTREZ_ identifier: 
+
+```{r echo=TRUE}
+#add gene annotation to top table
+aT1$SYMBOL<-unlist((lookUp(aT1$ID, anpack, 'SYMBOL')))
+aT1$ENTREZ<-unlist((lookUp(aT1$ID, anpack, 'ENTREZID')))
+aT1=aT1[!is.na(aT1$ENTREZ),]
+```
+Then we retain transcript clusters for which at least one probset was deemed expressed (see Methods section in the paper) and then recalculate the adjusted p-values since we would have not retained transcripts 1) without a valid gene identifer or 2) if they were not expressed, regardless of the p-value from the differential expression test: 
+
+```{r echo=TRUE}
+data(npspge) # based on detection above background from Affymetrix Transcriptome Analysis Console
+expressed=names(npspge)[npspge>0]
+aT1=aT1[rownames(aT1)%in%expressed,]
+aT1$adj.P.Val=p.adjust(aT1$P.Value,"fdr") #
+HTA[["GAEffect"]]<-aT1
+head(aT1,n=3)
+```
+A similar approach is used to generate a top table of differential expression statistics for the labor effect analysis. For both analyses the output is saved in a list (_HTA_) that will be used later.
+
+```{r echo=TRUE}
+aT1=analyzeLabor_limma(anoLabor,esetHTA[,rownames(anoLabor)])
+aT1$SYMBOL<-unlist((lookUp(aT1$ID, anpack, 'SYMBOL')))
+aT1$ENTREZ<-unlist((lookUp(aT1$ID, anpack, 'ENTREZID')))
+aT1=aT1[!is.na(aT1$ENTREZ),]
+aT1=aT1[rownames(aT1)%in%expressed,]
+aT1$adj.P.Val=p.adjust(aT1$P.Value,"fdr")
+HTA[["LaborEffect"]]<-aT1
+head(aT1,n=3)
+```
+
+### Differential expression with qRT-PCR data
+The gold standard of differential expression for a subset of `r dim(esetPCR)[1]` genes selected for validation, was defined using the same analysis models used for microarray data but using surrogates for log2 gene expression (-Delta CT values), for changes with gestational age:
+
+```{r echo=TRUE}
+PCR<-list()
+aT1=analyzeGA_limma(anoGA,esetPCR[,rownames(anoGA)])
+aT1$SYMBOL=rownames(aT1)
+aT1$Sig=(aT1$P.Value<0.05)
+PCR[["GAEffect"]]<-aT1
+head(aT1,n=3)
+```
+
+and changes with labor:
+
+```{r echo=TRUE}
+aT1=analyzeLabor_limma(anoLabor,esetPCR[,rownames(anoLabor)])
+aT1$SYMBOL=rownames(aT1)
+aT1$Sig=(aT1$P.Value<0.05)
+PCR[["LaborEffect"]]<-aT1
+head(aT1,n=3)
+```
+
+## Differential expression analysis for count data (sequencing platforms) 
+
+For the count data generated by the two sequencing based platfroms (RNASeq and DriverMap), we first define the two functions that will use negative binomial models implemented in _DESeq2_ package to identify genes that change with gestational age and with labor as follows:
+
+```{r echo=TRUE}
+analyzeGA_DESeq=function(ano,anoall,countM){
+  dds<- DESeqDataSetFromMatrix(countData= countM[,rownames(ano)],colData= ano,design=~T+IndividualID)
+  dds<- DESeq(dds) 
+  res<-results(dds,contrast=c("T","Term","Preterm"),independentFiltering=FALSE)
+  res=as.data.frame(res)
+  expressed=rownames(countM)[apply(countM[,rownames(anoall)]>=5,1,sum)>5]
+  res=res[rownames(res)%in%expressed,]
+  res=res[!is.na(res$log2FoldChange),]
+  res$logFC=res$log2FoldChange
+  names(res)[names(res)=="pvalue"]<-"P.Value"
+  names(res)[names(res)=="padj"]<-"adj.P.Val"
+  res
+}
+
+analyzeLabor_DESeq=function(ano,anoall,countM){
+  dds<- DESeqDataSetFromMatrix(countData= countM[,rownames(ano)],colData= ano,design=~Group)
+  dds<- DESeq(dds) 
+  res<-results(dds,contrast=c("Group","TIL","TNL"),independentFiltering=FALSE)
+  res=as.data.frame(res)
+  expressed=rownames(countM)[apply(countM[,rownames(anoall)]>=5,1,sum)>5]
+  res=res[rownames(res)%in%expressed,]
+  res=res[!is.na(res$log2FoldChange),]
+  res$logFC=res$log2FoldChange
+  names(res)[names(res)=="pvalue"]<-"P.Value"
+  names(res)[names(res)=="padj"]<-"adj.P.Val"
+  res
+}
+```
+
+In both functions above, after genes are tested and p-values are computed, we drop genes for which a fold change could not be estimated (mostly due to 0 counts) and genes which were not expressed (do not have a count >=5 in at least 5 of the 32 samples).
+Before applying the two functions we retrieve ENSEMBLE gene annotation so that gene symbols can be assigned to RNASeq differential expression results:
+```{r echo=TRUE}
+edb <- EnsDb.Hsapiens.v75
+Tx.ensemble <- transcripts(edb, columns = c("tx_id", "gene_id", "gene_name"),
+                           return.type = "DataFrame")
+```
+###Differential expression for RNASeq data
+The two count data differential expression functions are applied to the RNASeq data and results are stored in a list called _RNASeq_ as follows :
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+RNASeq<-list()
+#GA effect
+res=analyzeGA_DESeq(ano=anoGA,anoall=anoALL,countM=Rcount)
+res$SYMBOL=Tx.ensemble[match(rownames(res),Tx.ensemble[,2]),3]
+RNASeq[["GAEffect"]]<-res
+
+#labor effect
+res=analyzeLabor_DESeq(ano=anoLabor,anoall=anoALL,countM=Rcount)
+res$SYMBOL=Tx.ensemble[match(rownames(res),Tx.ensemble[,2]),3]
+RNASeq[["LaborEffect"]]<-res
+head(res,n=3)
+```
+
+###Differential expression for DriverMap
+The same functions used for RNASeq data above are applied to DriverMap derived count data, except that Sample_26 (involved on in the labor effect analysis) needs to be removed first due to contamination. As seen below, the correlation between expression profiles for this sample is unexpectedly low for DriverMap due to contamination:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+bk =seq(0, 1, by=0.025)
+heatmap.2(cor(Ccount),breaks=bk, main="DriverMap")
+heatmap.2(cor(Rcount),breaks=bk, main="RNASeq")
+```
+
+Note also that no gene annotation is needed, as the rows in the DriverMap cout data (_Ccount_) correspond already gene symbols:
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+CELLECTA=list()
+#GA effect
+anoall=anoALL
+anoall=anoall[anoall$SampleID!="Sample_26",] #remove the contaminated sample
+ano=anoGA
+ano=ano[ano$SampleID!="Sample_26",]
+res=analyzeGA_DESeq(ano,anoall,countM=Ccount)
+res$SYMBOL=rownames(res)
+CELLECTA[["GAEffect"]]<-res
+
+#labor effect
+res=analyzeLabor_DESeq(ano=anoLabor,anoall,countM=Ccount)
+res$SYMBOL=rownames(res)
+CELLECTA[["LaborEffect"]]<-res
+head(res,n=3)
+```
+
+##Preparing expression matrices for downsteam ploting and gene set signature analysis
+
+The gene expression matrices for platforms are next given shorter names, and prepared for downstream analyses by organizing the columns so that they correspond to the same samples. For count data, normalization is also applied to account for different library sizes. This is not needed for HTA data since it is already quantile normalized, while the qRT-PCR data used reference genes for normalization.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+Hr=esetHTA[,rownames(anoALL)] 
+Pr=esetPCR[,rownames(anoALL)]
+
+dds<- DESeqDataSetFromMatrix(countData= Rcount[,rownames(anoALL)],colData= anoALL,design=~IndividualID)
+dds=estimateSizeFactors(dds)
+Rr=counts(dds, normalized=TRUE)
+
+dds<- DESeqDataSetFromMatrix(countData= Ccount[,rownames(anoALL)],colData= anoALL,design=~IndividualID)
+dds=estimateSizeFactors(dds)
+Cr=counts(dds, normalized=TRUE)
+```
+Next, for microarray data, one transcript cluster expression profile is retained for a given unique gene symbol, while for RNASeq, one ENSEMBLE gene expression profile is retained for each gene symbol. Finally, the normalized count data matrices are added 0.5 count to enable log2 transformation.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+a=HTA[[2]] # 
+Hr=Hr[rownames(Hr)%in%rownames(a),]
+Hr=Hr[rownames(a),]
+Hr=Hr[!duplicated(a$SYMBOL),]
+rownames(Hr)=a[rownames(Hr),"SYMBOL"]
+
+a=RNASeq[[2]]
+Rr=Rr[rownames(Rr)%in%rownames(a),]
+Rr=Rr[rownames(a),]
+Rr=Rr[!duplicated(a$SYMBOL),]
+rownames(Rr)=a[rownames(Rr),"SYMBOL"]
+
+Rr=log2(Rr+0.5)
+Cr=log2(Cr+0.5)
+# Hr, Rr, Cr, Pr are the four expression sets (one row per gene symbol)
+```
+
+
+##Assessing the validation rates and differential expression overlap among platforms 
+To calculate the qRT-PCR validation rates (positive predicted values) for both comparisons (with gestation and and labor) for each of the three transcriptomics platform and create the differential expression overlap UpSet plots (Figure 1 in [@Tarca2018scirep]) we use the following:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+effs=c("GAEffect","LaborEffect")
+platforms=c("HTA","RNASeq","DriverMap")
+DEPile=list(HTA=HTA,RNASeq=RNASeq,DriverMap=CELLECTA)
+ddPile<-NULL
+
+for(eff in effs){
+  vaT1t=PCR[[eff]];#gold standard differential expression
+  DESymb=list()
+  for(platf in names(DEPile)){
+  x<-DEPile[[platf]][[eff]]
+  x=x[!is.na(x$SYMBOL),]
+  x$adj.P.Val<-p.adjust(x$P.Value,"fdr")
+  x=x[order(x$P.Value),]
+  x=x[!duplicated(x$SYMBOL),]
+  if(sum(x$adj.P.Val<0.1)>=1){
+  x=x[x$adj.P.Val<0.1,]
+  x$Tested=x$SYMBOL%in%vaT1t[,"ID"]
+  x$Validated=x$SYMBOL%in%vaT1t[vaT1t$Sig,"ID"]&sign(x$logFC)==sign(vaT1t$logFC[match(x$SYMBOL,vaT1t$ID)])
+  x$Method=platf
+  x$comp=eff
+  ddPile=rbind(ddPile,x[,c("SYMBOL","P.Value","adj.P.Val","logFC","Tested","Validated","Method","comp")])
+  DESymb[[platf]]<-paste(x$SYMBOL,ifelse(x$logFC>0,"+","-"))
+  }
+  }
+  upset(fromList(DESymb), order.by = "freq",text.scale = 1.3)
+  
+}
+```
+
+Note that in the code above, duplicated gene symbols are first removed (if any), and a gene is considered validated if it was positive by the omics platform and significant by qRT-PCR with a matching direction of change. The differential expression expression statistics (both comparisons) for each platform (one row per gene symbol) will be stored in data frames _ddH_, _ddR_ and _ddC_ for HTA, RNASeq and DriverMap (Cellecta), respectively: 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ddH=ddPile[ddPile$Method=="HTA",]
+ddR=ddPile[ddPile$Method=="RNASeq",]
+ddC=ddPile[ddPile$Method=="DriverMap",]
+```
+
+The qRT-PCR validation status of genes tested by each omics platfrom is now availble in the _ddPile_ data frame. To summarize validation rates for each method we use the code below:
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#genes present on all 4 platforms
+comg=table(c(unique(rbind(HTA[[1]],HTA[[2]])$SYMBOL),unique(rbind(RNASeq[[1]],RNASeq[[2]])$SYMBOL),
+             unique(rbind(CELLECTA[[1]],CELLECTA[[2]])$SYMBOL),PCR[[1]]$SYMBOL))
+comg=names(comg[comg==4])
+comg66=comg
+
+#validation rates
+a=ddPile[,c("SYMBOL","Tested","Validated","Method","comp")]
+b=a[a$Tested&a$SYMBOL%in%comg,]
+valTab=aggregate(b[,c("Tested","Validated")],by=list(Method=b$Method,Comp=b$comp),sum)
+valTab$Ratio=round(valTab$Validated/valTab$Tested*100,0)
+print(valTab)
+```
+The last column in the table above are the percentage validation rates for each platform and each comparison.
+
+##ROC curves analysis
+The calculation of gene validation rates required to define which gene is positive with a given platform. However, even though the p-values obtained with HTA microarrays for changes with labor may be meaningful, no gene was significant after multiple testing correction. The ROC curve analysis avoids the need for choosing significance cut-offs. The status of each gene  (TRUE of FALSE positive) for each platform and each method is first determined as above, yet now we retain data for all genes (regardless wether or not they were significant by omics platforms):
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ddPile<-NULL
+for(eff in effs){
+  #gold standard
+  vaT1t=PCR[[eff]];
+  for(platf in names(DEPile)){
+    #gold standard
+    x<-DEPile[[platf]][[eff]]
+    x=x[!is.na(x$SYMBOL),]
+    x$adj.P.Val<-p.adjust(x$P.Value,"fdr")
+    x=x[order(x$P.Value),]
+    x=x[!duplicated(x$SYMBOL),]
+      x$Tested=x$SYMBOL%in%vaT1t[,"ID"]
+      x$Validated=x$SYMBOL%in%vaT1t[vaT1t$Sig,"ID"]&sign(x$logFC)==sign(vaT1t$logFC[match(x$SYMBOL,vaT1t$ID)])
+      x$Method=platf
+      x$comp=eff
+      ddPile=rbind(ddPile,x[,c("SYMBOL","P.Value","adj.P.Val","logFC","Tested","Validated","Method","comp")])
+  }
+}
+```
+and then the ROC curves are created using:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+mycols=c("black","blue","red")
+names(mycols)<-platforms
+for(eff in effs){
+b=ddPile[ddPile$SYMBOL%in%comg&ddPile$comp==eff,]
+b$Validated=as.numeric(b$Validated)
+AUCs=NULL
+ for(platf in platforms){
+  tmp=b[b$Method==platf,]
+  pred <- prediction(1-tmp$P.Value, tmp$Validated)
+  perf <- performance(pred,measure="tpr", x.measure="fpr")
+  AUCs=c(AUCs,round(performance(pred,"auc")@y.values[[1]],2))
+  if(platf=="HTA"){
+  plot(perf,lwd=2,col=mycols[platf],main=eff)  
+  abline(c(0,0),c(1,1),col="grey")
+  }else{
+  points(perf@x.values[[1]],perf@y.values[[1]],lwd=2,col=mycols[platf],type="l")
+  }
+ }
+  legend("bottomright",lwd=c(2,2,2),col=mycols,
+         legend=paste(platforms," (AUC=",AUCs,")",sep=""),cex=0.75)
+}
+```
+
+##Correlation analysis of fold changes between omics platfroms and qRT-PCR 
+Next, for the the `r length(comg66)` genes profiled on all four platforms, we determine the correlation of log2 fold changes between each omics platfrom and qRT-PCR (gold standard) for both comparions (GA and Labor) (Figure 3 in [@Tarca2018scirep]). 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+for(eff in c("GAEffect","LaborEffect")){
+if(eff=="GAEffect"){lims=c(-1,2)}else{lims=c(-4,3)}
+for(platf in platforms){  
+m1=DEPile[[platf]][[eff]];m2=PCR[[eff]]
+tm=data.frame(x=m2[match(comg,m2$SYMBOL),"logFC"],y=m1[match(comg,m1$SYMBOL),"logFC"])
+plot(y~x,tm,xlab="qRT-PCR log2 FC",ylab=paste(platf,"log2 FC"),xlim=lims,ylim=lims,cex.lab=1.2,main=eff)  
+mo=lm(y~x,data=as.data.frame(tm))
+abline(mo$coef,col="red",lwd=2)
+abline(0,1,lty=2)
+}
+legend("bottomright",c(paste("R2=",round(summary(mo)$r.squared,2)),paste("Slope=",round(mo$coef[2],2))),cex=0.9,bty="n")
+}
+```
+
+
+
+##Overlap of differential expression among platforms with findings from other studies
+
+To determine the overlap of differentially expressed genes with gestational age with reports from previous studies, we first retain genes present on all three omics platfroms and extract statistics  for his comparison:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+comg=table(c(unique(rbind(HTA[[1]],HTA[[2]])$SYMBOL),unique(rbind(RNASeq[[1]],RNASeq[[2]])$SYMBOL),rownames(Cr)))
+comg=names(comg[comg==3])
+
+ddH=ddH[ddH$comp=="GAEffect"&ddH$SYMBOL%in%comg,]
+ddR=ddR[ddR$comp=="GAEffect"&ddR$SYMBOL%in%comg,]
+ddC=ddC[ddC$comp=="GAEffect"&ddC$SYMBOL%in%comg,]
+```
+
+The top tables of genes changing with gestation by [@pmid27711190] and [@pmid27333071] are next filtered and duplicates are removed:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+data(heng)
+data(algarawi)
+
+heng=heng[heng$adj.P.Val<0.05,]
+heng=heng[!duplicated(heng$SYMBOL),]
+
+algarawi$SYMBOL=algarawi$Gene.symbol
+algarawi=algarawi[!duplicated(algarawi$SYMBOL),]
+algarawi=algarawi[algarawi$adj.P.Val<0.05,]
+```
+
+The erichment analysis preseneted in Table 1 of  [@Tarca2018scirep] are obtained as follows:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+mygslist=list(HengEtAl=heng$SYMBOL,AlGarawiEtAl=algarawi$SYMBOL)
+des=list(ddH,ddR,ddC)
+names(des)<-c("HTA","RNASeq","DriverMap")
+respile=NULL
+
+for(me in names(des)){
+  mygns=des[[me]]$SYMBOL
+  gns<-OR<-pv<-ns<-NULL
+  for(gs in 1:length(mygslist)){
+    path=intersect(mygslist[[gs]],comg)
+    noMy=length(intersect(mygns,path))
+    gns=c(gns,paste(intersect(mygns,path),collapse=";"))
+    if(noMy>=1){
+      q = noMy ; m = length(path); n = length(comg) -length(path); k = length(mygns)
+      pv=c(pv,phyper(q = noMy - 1, m = length(path), n = length(comg) - length(path), k = length(mygns), lower.tail = FALSE)) 
+      OR=c(OR,fisher.test(matrix(c(q,k-q,m-q,n-k+q),2,2))$est)
+      ns=c(ns,noMy)
+    }else{pv=c(pv,NA);OR=c(OR,NA);ns=c(ns,0)}                
+  }
+  res=data.frame(Method=me,ID=names(mygslist),N=ns,OR=OR)
+  res$P=pv; 
+  respile=rbind(respile,res)
+}
+print(respile)
+```
+
+In the table above, p-values and odds-ratios quantify the extent of the overlap between genes changing with gestation in this study and previous reports. 
+
+
+##Analysis of gene set signature expression 
+In this last section, we will present analysis of gene set expression, where gene sets are defined as those specific to different cell types using  single cell experiments [@pmid28830992]. In these analyses the expression over a given gene set will be averaged within a given sample and then associations with gestational age and labor will be tested. In these analyses we will use gene expression matrices in which rows correspond to an unique gene symbol as described above, and consider only genes present on all three platforms.
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+comg=c(rownames(Hr),rownames(Rr),rownames(Cr))
+comg=names(table(comg)[table(comg)==3]) 
+
+data(SCGeneSets)
+SCGeneSets=SCGeneSets[SCGeneSets$Symbol%in%comg,]
+head(SCGeneSets)
+table(SCGeneSets$Type)
+```
+
+Next, we use linear mixed-effect models with splines to fit gene set expression summaries as a function of gestational age and plot these against the raw data:
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+nms=c("HTA","RNA-Seq","DriverMap")
+ys=c("H","R","C")
+ano=anoALL
+ano=ano[ano$SampleID!="Sample_26",] #remove contaminated sample
+z=bs(ano$GA,degree=2,knots=1,intercept=FALSE)
+colnames(z)<-paste("t",colnames(z),sep="")
+ano=cbind(ano,z)
+
+for( sig in c("T cell","B cell")){
+  #simple mean
+  ano$H=apply(Hr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+  ano$R=apply(Rr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+  ano$C=apply(Cr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+
+  for(meths in 1:3){
+   ano$Y=ano[,ys[meths]]
+  plot(0,0,ylab=paste(sig,"signature"),xlab="Gestational age (weeks)",ylim=c(min(ano$Y)-0.9,max(ano$Y)),xlim=c(12,40),main=nms[meths], cex.lab=1.2)
+  for(i in unique(ano$IndividualID)){
+    ano2=ano[ano$IndividualID==i,]
+   points(Y~GA,ano2,type="l")
+  }
+
+mod1=lmer(Y~0+t1+t2+t3+(1|IndividualID),data = ano,control=lmerControl(optimizer="bobyqa"),REML=FALSE)  
+mod2=lmer(Y~1+(1|IndividualID),data = ano,control=lmerControl(optimizer="bobyqa"),REML=FALSE)  
+
+p=anova(mod1,mod2)$"Pr(>Chisq)"[2]
+pred=expand.grid(GA=seq(12.2,39.5,by=0.1),IndividualID="newpoint")
+tmp=predict(z,pred$GA)
+colnames(tmp)<-paste("t",colnames(tmp),sep="")
+pred=cbind(pred,tmp)
+
+pred$Y=predict(mod1,pred,allow.new.levels=TRUE)
+points(Y~GA,pred,type="l",lwd=2,col="blue")
+
+FC=(max(pred$Y)-min(pred$Y))
+legend("bottomleft",c(paste("log2FC=",round(FC,2)),paste("p=",round(p,4))),cex=0.9,bty="n")
+}
+
+}
+```
+
+Next we compare the gene set expression for T cell between women in labor (TIL) and those not in Labor (TNL):
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#Labor effect on signature summary
+ano=anoLabor
+ano$Group0=factor(ifelse(ano$Group=="TIL","TIL","_TNL"))
+sig="T cell"
+  ano$H=apply(Hr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+  ano$R=apply(Rr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+  ano$C=apply(Cr[SCGeneSets[SCGeneSets$Type==sig,"Symbol"],ano$SampleID],2,mean)
+  
+  for(meths in 1:3){
+  ano$Y=ano[,ys[meths]]
+  lgFC=mean(ano$Y[ano$Group=="TIL"])-mean(ano$Y[ano$Group=="TNL"])
+  pv=t.test(ano$Y[ano$Group=="TIL"],ano$Y[ano$Group=="TNL"])$p.value
+  boxplot(Y~Group0,ano,ylab=sig,ylim=c(min(ano$Y)-0.9,max(ano$Y)),main=nms[meths],cex.axis=1.2)
+  legend("bottomleft",c(paste("log2FC=",round(lgFC,2)),paste("p=",round(pv,4))),cex=0.9,bty="n")
+  }
+``` 
+
+ 
+ Since some of the genes profiled by qRT-PCR were part of the T cell signature, we compare the correlation between the T cell signature expression between each omics platform and qRT-PCR:
+   
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ano=anoLabor
+
+data(SCGeneSets)
+SCGeneSets=SCGeneSets[SCGeneSets$Symbol%in%rownames(Pr),]
+
+Ps=apply(Pr[rownames(Pr)%in%SCGeneSets$Symbol,ano$SampleID],2,mean) #PCR
+Hs=apply(Hr[rownames(Hr)%in%SCGeneSets$Symbol,ano$SampleID],2,mean) #HTA
+Rs=apply(Rr[rownames(Rr)%in%SCGeneSets$Symbol,ano$SampleID],2,mean) #RNAseq
+Cs=apply(Cr[rownames(Cr)%in%SCGeneSets$Symbol,ano$SampleID],2,mean) #DriverMap 
+ano$Ps=Ps
+
+ys=list(Hs,Rs,Cs)
+names(ys)<-c("HTA","RNA-Seq","DriverMap")
+
+x=Ps
+for( k in 1:length(ys)){
+y=ys[[k]]
+m=lm(y~x)
+plot(x,y,xlab="qRT-PCR log2 FC",pch=19,ylab=paste(names(ys)[k],"log2 FC"),cex.lab=1.2)
+abline(m$coef)
+legend("topleft",c(paste("R2=",round(summary(m)$r.squared,2)),paste(" Slope=",round(m$coef[2],2))))
+}
+``` 
+
+ To obtain a heatmap representation of the gene expression for all genes part of the T cell signature in samples collected from women in labor and those not in labor at term, we select first the genes present on all three platfroms that are part of this signature and sort them by the log2 fold change of one of the platforms:  
+ 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+data(SCGeneSets)
+SCGeneSets=SCGeneSets[SCGeneSets$Symbol%in%comg,]
+
+tg1=CELLECTA[[2]]
+tg1=tg1[tg1$SYMBOL%in%SCGeneSets[SCGeneSets$Type=="T cell","Symbol"],]
+tg1=tg1[order(tg1$logFC),]
+
+ano=anoLabor
+ano=ano[order(ano$Group,decreasing=TRUE),]
+coms=as.character(ano$SampleID)
+gr=as.character(ano$Group)
+
+heatmap.2(Hr[tg1$SYMBOL,coms],col=maPalette(low = "green", high = "red", k = 50),Colv=FALSE,Rowv=FALSE,ColSideColors=ifelse(gr=="TIL","red","blue"),cexRow=1.2,
+          scale="row",margins =c(4,5),trace="none",labCol = FALSE,main="HTA",dendrogram="none")
+heatmap.2(Rr[tg1$SYMBOL,coms],col=maPalette(low = "green", high = "red", k = 50),Colv=FALSE,Rowv=FALSE,ColSideColors=ifelse(gr=="TIL","red","blue"),cexRow=1.2,
+          scale="row",margins =c(4,5),trace="none",labCol = FALSE,main="RNASeq",dendrogram="none")
+heatmap.2(Cr[tg1$SYMBOL,coms],col=maPalette(low = "green", high = "red", k = 50),Colv=FALSE,Rowv=FALSE,ColSideColors=ifelse(gr=="TIL","red","blue"),cexRow=1.2,
+          scale="row",margins =c(4,5),trace="none",labCol = FALSE,main="DriverMap",dendrogram="none")
+``` 
+ 
+The point made with the heatmaps above is that genes part of the T cell signature defined based on single cell analysis tend to have higher expression (more red color) in women in the TIL group.
+
+## R session info
+The details of the R session that generated these results are:
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sessionInfo()
+``` 
+
+
+# References  
+  

@@ -1,0 +1,10 @@
+Package: pregnomics
+Type: Package
+Title: Data package for the study: Targeted expression profiling by RNA-Seq improves detection of cellular dynamics during pregnancy and identifies a role for T cells in term parturition
+Version: 1.0
+Date: 2018-11-29
+Author: Adi L Tarca
+Maintainer: Adi L Tarca <adi@wayne.edu>
+Description: Inlcudes gene expression data obtained with four platforms for 32 blood samples as well as relevant metadata for samples, genes, and gene sets relevant to the study.
+License: MIT + file LICENSE
+RoxygenNote: 6.1.1
